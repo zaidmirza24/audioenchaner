@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import gc
 
-app = FastAPI(title="Audio Enhancer - Nuclear RAM Mode")
+app = FastAPI(title="Audio Enhancer - Smooth Nuclear Mode")
 
 # Ensure static directory exists
 Path("static").mkdir(parents=True, exist_ok=True)
@@ -36,13 +36,17 @@ def highpass_filter(data, cutoff, fs, order=5):
     y = lfilter(b, a, data)
     return y
 
-def apply_compression(y, threshold_db=-18, ratio=3):
+def apply_compression(y, threshold_db=-22, ratio=4):
     eps = 1e-9
     y_db = 20 * np.log10(np.abs(y) + eps)
     mask = y_db > threshold_db
     y_db[mask] = threshold_db + (y_db[mask] - threshold_db) / ratio
     y_comp = np.sign(y) * (10**(y_db / 20))
     return y_comp
+
+def apply_limiter(y):
+    """Simple Hard Limiter to prevent clipping"""
+    return np.clip(y, -0.99, 0.99)
 
 def cleanup_temp_dir(path: str):
     try:
@@ -64,7 +68,6 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 2. Get Audio Info
         info = sf.info(input_path)
         orig_sr = info.samplerate
         total_frames = info.frames
@@ -73,68 +76,87 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         # TARGET SPECS
         TARGET_SR = 16000
         CHUNK_SECONDS = 20
-        CHUNK_SIZE_SAMPLES = int(CHUNK_SECONDS * orig_sr)
+        OVERLAP_SECONDS = 1
         
-        # 3. GLOBAL NOISE PROFILE (The "Surgical Anchor")
-        # Load the first 3 seconds to get a clean noise floor estimate
+        CHUNK_SAMPLES = int(CHUNK_SECONDS * orig_sr)
+        OVERLAP_SAMPLES = int(OVERLAP_SECONDS * orig_sr)
+        TARGET_OVERLAP_SAMPLES = int(OVERLAP_SECONDS * TARGET_SR)
+
+        # 3. GLOBAL NOISE PROFILE
         noise_chunk, _ = sf.read(input_path, start=0, frames=int(3 * orig_sr), dtype='float32')
         if channels > 1:
             noise_chunk = np.mean(noise_chunk, axis=1)
         if orig_sr != TARGET_SR:
             noise_chunk = resample_poly(noise_chunk, TARGET_SR, orig_sr)
-        
-        # Capture profile once
         noise_profile = noise_chunk
         del noise_chunk
         gc.collect()
 
+        prev_overlap = None
+
         with sf.SoundFile(output_path, mode='w', samplerate=TARGET_SR, channels=1) as out_f:
-            for start in range(0, total_frames, CHUNK_SIZE_SAMPLES):
-                # 1. Read chunk
-                chunk, _ = sf.read(input_path, start=start, frames=CHUNK_SIZE_SAMPLES, dtype='float32')
+            for start in range(0, total_frames, CHUNK_SAMPLES):
+                # Read 21s (chunk + overlap)
+                read_len = CHUNK_SAMPLES + OVERLAP_SAMPLES
+                chunk, _ = sf.read(input_path, start=start, frames=read_len, dtype='float32')
                 
-                # 2. Mono conversion
+                if len(chunk) == 0: break
+
+                # A. Mono
                 if channels > 1:
                     chunk = np.mean(chunk, axis=1)
                     gc.collect()
                 
-                # 3. Downsample to 16kHz
+                # B. Downsample
                 if orig_sr != TARGET_SR:
                     chunk = resample_poly(chunk, TARGET_SR, orig_sr)
                     gc.collect()
 
-                # 4. Surgical Noise Reduction (prop_decrease=1.0 for max cleaning)
-                # Using the global anchor for consistent hiss removal
-                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, y_noise=noise_profile, stationary=True, prop_decrease=1.0)
+                # C. Balanced NR (0.85 to avoid robotic sound)
+                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, y_noise=noise_profile, stationary=True, prop_decrease=0.85)
                 gc.collect()
 
-                # 5. Voice Band-pass Filter (80 Hz - 8000 Hz)
-                # Removes low rumble and high-pitched hiss simultaneously
+                # D. Voice Band-pass (80-7500Hz)
                 chunk = highpass_filter(chunk, 80, TARGET_SR)
-                # Simple low-pass at 8kHz for hiss reduction
                 nyq = 0.5 * TARGET_SR
-                b, a = butter(5, 7500/nyq, btype='low')
+                b, a = butter(4, 7500/nyq, btype='low')
                 chunk = lfilter(b, a, chunk)
                 gc.collect()
 
-                # 6. Stronger Compression for defined voice
-                chunk = apply_compression(chunk, threshold_db=-22, ratio=4)
+                # E. Compression & Limiting
+                chunk = apply_compression(chunk)
+                chunk = apply_limiter(chunk)
                 gc.collect()
 
-                # 7. Smart Loudness Normalization
+                # F. Normalization
                 try:
                     meter = pyln.Meter(TARGET_SR)
                     loudness = meter.integrated_loudness(chunk)
-                    
-                    # Tightened threshold to avoid boosting high-noise silent chunks
                     if loudness > -40.0:
                         chunk = pyln.normalize.loudness(chunk, loudness, -14.0)
-                    gc.collect()
+                        chunk = apply_limiter(chunk) # Final safety check
                 except:
                     pass
 
-                # 8. Write & Cleanup
-                out_f.write(chunk)
+                # G. Overlap-Add Crossfade
+                if prev_overlap is not None:
+                    # Linear crossfade for the first 1s of THIS chunk with PREVIOUS tail
+                    fade_in = np.linspace(0, 1, TARGET_OVERLAP_SAMPLES)
+                    fade_out = 1.0 - fade_in
+                    
+                    # Blend the overlap region
+                    chunk[:TARGET_OVERLAP_SAMPLES] = (chunk[:TARGET_OVERLAP_SAMPLES] * fade_in) + (prev_overlap * fade_out)
+                    
+                # Store the last 1s of this chunk for the NEXT call
+                # We only write up to CHUNK_SAMPLES to keep timing perfect
+                write_size = min(len(chunk), int(CHUNK_SECONDS * TARGET_SR))
+                out_f.write(chunk[:write_size])
+                
+                if len(chunk) > write_size:
+                    prev_overlap = chunk[write_size:write_size + TARGET_OVERLAP_SAMPLES]
+                else:
+                    prev_overlap = None
+                
                 del chunk
                 gc.collect()
 
@@ -143,5 +165,5 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
     except Exception as e:
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
-        print(f"Nuclear Error: {e}")
+        print(f"Smooth Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
