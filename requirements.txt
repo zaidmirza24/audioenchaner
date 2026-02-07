@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-librosa
 soundfile
 numpy
 noisereduce
