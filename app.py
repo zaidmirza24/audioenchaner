@@ -77,53 +77,50 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         total_frames = info.frames
         channels = info.channels
 
-        # Chunk Settings: 5 minutes = 300 seconds
-        CHUNK_SECONDS = 300
+        # Chunk Settings: 60 seconds (Reduced from 300 for 512MB RAM safety)
+        CHUNK_SECONDS = 60
         CHUNK_SIZE = int(CHUNK_SECONDS * sr)
         
-        # Prepare Output File
-        # Target: Mono, 44.1kHz (Note: Soundfile doesn't resample automatically. 
-        # For simplicity and memory, we'll keep input SR but convert to mono if needed)
-        # The prompt mentioned 44.1kHz, but soundfile read/write doesn't include a resampler.
-        # We will use the original SR to avoid complex resampling dependencies in a low-RAM env.
-        
+        import gc
+
         with sf.SoundFile(output_path, mode='w', samplerate=sr, channels=1) as out_f:
             # 3. Process in Chunks
             for start in range(0, total_frames, CHUNK_SIZE):
                 # Read chunk
                 chunk, _ = sf.read(input_path, start=start, frames=CHUNK_SIZE, dtype='float32')
                 
-                # Convert to Mono if Stereo
+                # Convert to Mono if Stereo immediately
                 if channels > 1:
                     chunk = np.mean(chunk, axis=1)
+                    gc.collect()
                 
                 # A. High-pass filter (80 Hz)
                 chunk = highpass_filter(chunk, 80, sr)
+                gc.collect()
 
                 # B. Noise Reduction (prop_decrease=0.8)
-                # Note: nr works best on chunks, but for streaming, zero-padding or overlap helps.
-                # In this simple implementation, we'll process chunks directly.
+                # Stationary=True can also save RAM if noise is constant
                 chunk = nr.reduce_noise(y=chunk, sr=sr, prop_decrease=0.8)
+                gc.collect()
 
                 # C. Light Compression
                 chunk = apply_compression(chunk, threshold_db=-18, ratio=3)
+                gc.collect()
 
                 # D. Loudness Normalization to -14 LUFS
-                # We normalize each chunk to keep memory usage flat.
                 try:
                     meter = pyln.Meter(sr)
                     loudness = meter.integrated_loudness(chunk)
                     chunk = pyln.normalize.loudness(chunk, loudness, -14.0)
+                    gc.collect()
                 except:
-                    # If chunk is too short or silent, skip normalization
                     pass
 
                 # Write chunk to final file
                 out_f.write(chunk)
                 
-                # Explicit cleanup for RAM
+                # Final cleanup for this chunk
                 del chunk
-                import gc
                 gc.collect()
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
