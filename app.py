@@ -75,50 +75,47 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         CHUNK_SECONDS = 20
         CHUNK_SIZE_SAMPLES = int(CHUNK_SECONDS * orig_sr)
         
-        # We'll pre-calculate the noise profile from the first chunk to save memory in future chunks
-        noise_profile = None
-
         with sf.SoundFile(output_path, mode='w', samplerate=TARGET_SR, channels=1) as out_f:
             for start in range(0, total_frames, CHUNK_SIZE_SAMPLES):
-                # Read chunk in original SR
+                # 1. Read chunk
                 chunk, _ = sf.read(input_path, start=start, frames=CHUNK_SIZE_SAMPLES, dtype='float32')
                 
-                # A. Mono conversion
+                # 2. Mono conversion
                 if channels > 1:
                     chunk = np.mean(chunk, axis=1)
+                    gc.collect()
                 
-                # B. Downsample to 16kHz using scipy (memory efficient)
+                # 3. Downsample to 16kHz
                 if orig_sr != TARGET_SR:
                     chunk = resample_poly(chunk, TARGET_SR, orig_sr)
                     gc.collect()
 
-                # C. High-pass filter (80 Hz)
+                # 4. Adaptive Noise Reduction (stationary=False for better quality)
+                # We process each 20s chunk independently so it adapts to changing noise
+                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, stationary=False, prop_decrease=0.85)
+                gc.collect()
+
+                # 5. High-pass filter (80 Hz) - Performed AFTER NR to clean artifacts
                 chunk = highpass_filter(chunk, 80, TARGET_SR)
                 gc.collect()
 
-                # D. Noise Reduction
-                if noise_profile is None:
-                    # Capture noise profile from first 2 seconds of the first chunk
-                    profile_len = min(int(2 * TARGET_SR), len(chunk))
-                    noise_profile = chunk[:profile_len]
-                
-                # Use stationary=True for consistent memory usage and reuse profile
-                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, y_noise=noise_profile, stationary=True)
+                # 6. Stronger Compression for defined voice
+                chunk = apply_compression(chunk, threshold_db=-22, ratio=4)
                 gc.collect()
 
-                # E. Light Compression
-                chunk = apply_compression(chunk, threshold_db=-18, ratio=3)
-                gc.collect()
-
-                # F. Loudness Normalization to -14 LUFS
+                # 7. Smart Loudness Normalization
                 try:
                     meter = pyln.Meter(TARGET_SR)
                     loudness = meter.integrated_loudness(chunk)
-                    chunk = pyln.normalize.loudness(chunk, loudness, -14.0)
+                    
+                    # Only normalize if there's actual signal (not just silence/low hum)
+                    if loudness > -45.0:
+                        chunk = pyln.normalize.loudness(chunk, loudness, -14.0)
                     gc.collect()
                 except:
                     pass
 
+                # 8. Write & Cleanup
                 out_f.write(chunk)
                 del chunk
                 gc.collect()
