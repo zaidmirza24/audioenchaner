@@ -64,17 +64,30 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        # 2. Get Audio Info
         info = sf.info(input_path)
         orig_sr = info.samplerate
         total_frames = info.frames
         channels = info.channels
 
-        # TARGET SPECS (16kHz Mono = Nuclear RAM Safety)
+        # TARGET SPECS
         TARGET_SR = 16000
-        # 20 second chunks @ 16kHz = only 320,000 samples (Extremely light!)
         CHUNK_SECONDS = 20
         CHUNK_SIZE_SAMPLES = int(CHUNK_SECONDS * orig_sr)
         
+        # 3. GLOBAL NOISE PROFILE (The "Surgical Anchor")
+        # Load the first 3 seconds to get a clean noise floor estimate
+        noise_chunk, _ = sf.read(input_path, start=0, frames=int(3 * orig_sr), dtype='float32')
+        if channels > 1:
+            noise_chunk = np.mean(noise_chunk, axis=1)
+        if orig_sr != TARGET_SR:
+            noise_chunk = resample_poly(noise_chunk, TARGET_SR, orig_sr)
+        
+        # Capture profile once
+        noise_profile = noise_chunk
+        del noise_chunk
+        gc.collect()
+
         with sf.SoundFile(output_path, mode='w', samplerate=TARGET_SR, channels=1) as out_f:
             for start in range(0, total_frames, CHUNK_SIZE_SAMPLES):
                 # 1. Read chunk
@@ -90,13 +103,18 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
                     chunk = resample_poly(chunk, TARGET_SR, orig_sr)
                     gc.collect()
 
-                # 4. Adaptive Noise Reduction (stationary=False for better quality)
-                # We process each 20s chunk independently so it adapts to changing noise
-                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, stationary=False, prop_decrease=0.85)
+                # 4. Surgical Noise Reduction (prop_decrease=1.0 for max cleaning)
+                # Using the global anchor for consistent hiss removal
+                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, y_noise=noise_profile, stationary=True, prop_decrease=1.0)
                 gc.collect()
 
-                # 5. High-pass filter (80 Hz) - Performed AFTER NR to clean artifacts
+                # 5. Voice Band-pass Filter (80 Hz - 8000 Hz)
+                # Removes low rumble and high-pitched hiss simultaneously
                 chunk = highpass_filter(chunk, 80, TARGET_SR)
+                # Simple low-pass at 8kHz for hiss reduction
+                nyq = 0.5 * TARGET_SR
+                b, a = butter(5, 7500/nyq, btype='low')
+                chunk = lfilter(b, a, chunk)
                 gc.collect()
 
                 # 6. Stronger Compression for defined voice
@@ -108,8 +126,8 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
                     meter = pyln.Meter(TARGET_SR)
                     loudness = meter.integrated_loudness(chunk)
                     
-                    # Only normalize if there's actual signal (not just silence/low hum)
-                    if loudness > -45.0:
+                    # Tightened threshold to avoid boosting high-noise silent chunks
+                    if loudness > -40.0:
                         chunk = pyln.normalize.loudness(chunk, loudness, -14.0)
                     gc.collect()
                 except:
