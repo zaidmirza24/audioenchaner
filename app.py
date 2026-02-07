@@ -70,12 +70,13 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 2. Load audio
-        y, sr = librosa.load(input_path, sr=None)
+        # 2. Load audio (Optimized for Memory: 16kHz Mono)
+        # 16kHz is perfect for speech and uses ~3x less memory than 44.1kHz
+        y, sr = librosa.load(input_path, sr=16000, mono=True)
 
         # 3. Processing Pipeline
         
-        # A. High-pass filter (cutoff = 80 Hz) to remove low-end rumble
+        # A. High-pass filter (cutoff = 80 Hz)
         y = highpass_filter(y, 80, sr)
 
         # B. Noise Reduction (prop_decrease=0.8)
@@ -88,9 +89,17 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
         meter = pyln.Meter(sr)
         loudness = meter.integrated_loudness(y)
         y_normalized = pyln.normalize.loudness(y, loudness, -14.0)
+        
+        # Free up 'y' memory immediately
+        del y
+        import gc
+        gc.collect()
 
         # 4. Save enhanced file as WAV
         sf.write(output_path, y_normalized, sr)
+        
+        del y_normalized
+        gc.collect()
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
