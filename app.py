@@ -193,9 +193,11 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
                 # H. Overlap-Add Crossfade
                 if prev_overlap is not None:
-                    fade_in = np.linspace(0, 1, TARGET_OVERLAP_SAMPLES)
-                    fade_out = 1.0 - fade_in
-                    chunk[:TARGET_OVERLAP_SAMPLES] = (chunk[:TARGET_OVERLAP_SAMPLES] * fade_in) + (prev_overlap * fade_out)
+                    actual_overlap = min(len(prev_overlap), len(chunk), TARGET_OVERLAP_SAMPLES)
+                    if actual_overlap > 0:
+                        fade_in = np.linspace(0, 1, actual_overlap)
+                        fade_out = 1.0 - fade_in
+                        chunk[:actual_overlap] = (chunk[:actual_overlap] * fade_in) + (prev_overlap[:actual_overlap] * fade_out)
                     
                 write_size = min(len(chunk), int(CHUNK_SECONDS * TARGET_SR))
                 out_f.write(chunk[:write_size])
