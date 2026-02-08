@@ -276,6 +276,7 @@
             // UI Reset
             btn.disabled = true;
             statusText.textContent = 'Processing...';
+            statusText.style.color = 'var(--text)';
             loader.style.display = 'flex';
             downloadLink.style.display = 'none';
             percentageDisp.textContent = '0%';
@@ -303,9 +304,21 @@
 
                     percentageDisp.textContent = '100%';
                     statusText.textContent = 'Done ✅';
+                    statusText.style.color = 'var(--text)';
                     clearInterval(processingInterval);
                 } else {
-                    statusText.textContent = 'Error: Processing failed';
+                    // Parse error from Blob
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        try {
+                            const error = JSON.parse(reader.result);
+                            statusText.textContent = `❌ ${error.detail || 'Processing failed'}`;
+                        } catch (e) {
+                            statusText.textContent = '❌ Error: Processing failed';
+                        }
+                        statusText.style.color = '#ef4444'; // Red
+                    };
+                    reader.readAsText(xhr.response);
                     clearInterval(processingInterval);
                 }
                 loader.style.display = 'none';
