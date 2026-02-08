@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import gc
+from gradio_client import Client, handle_file
 
 app = FastAPI(title="Audio Enhancer - Vintage Clean Mode")
 
@@ -46,6 +47,63 @@ def apply_compression(y, threshold_db=-22, ratio=4):
 
 def apply_limiter(y):
     return np.clip(y, -0.99, 0.99)
+
+def apply_vocal_warmth(y, sr, amount=0.3):
+    """
+    Adds tube-style warmth using soft saturation and a low-mid boost.
+    """
+    # 1. Subtle low-mid boost (200-400Hz)
+    nyq = 0.5 * sr
+    b, a = butter(2, [150/nyq, 450/nyq], btype='band')
+    warm_band = lfilter(b, a, y)
+    
+    # 2. Soft saturation
+    saturated = np.tanh(y * (1 + amount)) / (1 + amount)
+    
+    # 3. Blend
+    return saturated + (0.1 * warm_band)
+
+def apply_vocal_presence(y, sr, amount=0.15):
+    """
+    Boosts the 'presence' range (3kHz-5kHz) for better articulation.
+    """
+    nyq = 0.5 * sr
+    b, a = butter(2, [3000/nyq, 5500/nyq], btype='band')
+    presence_band = lfilter(b, a, y)
+    return y + (amount * presence_band)
+
+def apply_deesser(y, sr, threshold=0.15):
+    """
+    Attenuates harsh high frequencies (5kHz-8kHz) typical of AI artifacts.
+    """
+    nyq = 0.5 * sr
+    b, a = butter(2, 5500/nyq, btype='high')
+    sibilance = lfilter(b, a, y)
+    
+    # Simple dynamic suppression
+    mask = np.abs(sibilance) > threshold
+    y[mask] *= 0.85 # Reduce harsh peaks
+    return y
+
+def apply_noise_guard(y, threshold=0.015, attack=0.05, release=0.2):
+    """
+    Advanced noise gate to ensure absolute silence between words.
+    Helps eliminate AI 'air' noise.
+    """
+    # Simple RMS-based gate
+    window_size = int(0.02 * 16000) # 20ms windows
+    num_windows = len(y) // window_size
+    
+    for i in range(num_windows):
+        start = i * window_size
+        end = start + window_size
+        window = y[start:end]
+        rms = np.sqrt(np.mean(window**2))
+        
+        if rms < threshold:
+            y[start:end] = 0.0
+            
+    return y
 
 def consonant_exciter(y, sr, amount=0.15):
     """
@@ -102,7 +160,8 @@ def cleanup_temp_dir(path: str):
         pass
 
 @app.post("/enhance")
-async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...), use_ai: str = "false"):
+    use_ai = use_ai.lower() == "true"
     if not file.filename.lower().endswith(('.mp3', '.wav')):
         raise HTTPException(status_code=400, detail="Only .mp3 and .wav files are supported")
 
@@ -160,7 +219,9 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
                     noise_profile = chunk[:profile_len]
 
                 # C. Noise Reduction (Adaptive to profile)
-                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, y_noise=noise_profile, stationary=True, prop_decrease=0.88)
+                # If use_ai is True, we go AGGRESSIVE (1.0) because AI reconstructs the voice
+                nr_strength = 1.0 if use_ai else 0.88
+                chunk = nr.reduce_noise(y=chunk, sr=TARGET_SR, y_noise=noise_profile, stationary=True, prop_decrease=nr_strength)
                 gc.collect()
 
                 # D. VINTAGE FIX 1: De-reverb (Echo Killer)
@@ -173,8 +234,10 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
                 # F. Filtering (Voice Band-pass 80-7500Hz)
                 chunk = highpass_filter(chunk, 80, TARGET_SR)
+                # Hard cut high-end hiss if using AI
+                cutoff = 7000 if use_ai else 7500
                 nyq = 0.5 * TARGET_SR
-                b, a = butter(4, 7500/nyq, btype='low')
+                b, a = butter(4, cutoff/nyq, btype='low')
                 chunk = lfilter(b, a, chunk)
                 gc.collect()
 
@@ -210,6 +273,56 @@ async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = Fi
                 current_time_s += CHUNK_SECONDS
                 del chunk
                 gc.collect()
+
+        # --- AI ENHANCEMENT BRANCH ---
+        if use_ai:
+            try:
+                # Use Resemble Enhance on Hugging Face (High Quality)
+                # This model performs "Super-Resolution" and "Neural Restoration"
+                hf_token = os.environ.get("HF_TOKEN")
+                if not hf_token:
+                    raise Exception("HF_TOKEN environment variable not found. Please set it in Render dashboard.")
+                
+                client = Client("ResembleAI/resemble-enhance", token=hf_token)
+                result = client.predict(
+                    handle_file(output_path), # input_audio
+                    "Midpoint",             # cfm_ode_solver
+                    128,                     # cfm_nfe (MAXIMIZED for Detail)
+                    0.5,                     # cfm_prior_temperature
+                    True,                    # denoise_before_enhancement
+                    api_name="/predict"
+                )
+                
+                # Copy the AI result back to our output_path
+                shutil.copy(result[1], output_path)
+                
+                # --- POST-AI SUPER POLISH ---
+                print("Applying Super Polish...")
+                data, sr = sf.read(output_path)
+                
+                # 1. Warmth & Weight
+                data = apply_vocal_warmth(data, sr)
+                
+                # 2. Presence & Clarity
+                data = apply_vocal_presence(data, sr)
+                
+                # 3. De-Esser (Softens AI harshness)
+                data = apply_deesser(data, sr)
+                
+                # 4. Noise Guard (Ensures silence in pauses)
+                data = apply_noise_guard(data)
+                
+                # 5. Final Mastering Pass
+                meter = pyln.Meter(sr)
+                loudness = meter.integrated_loudness(data)
+                data = pyln.normalize.loudness(data, loudness, -14.0)
+                data = apply_limiter(data)
+                
+                sf.write(output_path, data, sr)
+                print("Super Polish complete.")
+            except Exception as ai_e:
+                print(f"AI Enhancement failed, falling back to Standard: {ai_e}")
+                # We continue with the existing 'output_path' which already has the standard enhancement
 
         background_tasks.add_task(cleanup_temp_dir, temp_dir)
         return FileResponse(output_path, media_type="audio/wav", filename=os.path.basename(output_path))

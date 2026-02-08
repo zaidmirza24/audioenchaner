@@ -216,6 +216,85 @@
             margin-bottom: 1rem;
             display: block;
         }
+
+        /* Toggle Switch Styles */
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin: 1.5rem 0;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 48px;
+            height: 24px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #334155;
+            transition: .4s;
+            border-radius: 24px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked+.slider {
+            background-color: var(--primary);
+        }
+
+        input:checked+.slider:before {
+            transform: translateX(24px);
+        }
+
+        .toggle-label {
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: var(--text-dim);
+        }
+
+        input:checked~.toggle-label {
+            color: var(--text);
+        }
+
+        .badge {
+            background: var(--primary);
+            color: white;
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
     </style>
 </head>
 
@@ -232,6 +311,15 @@
             <p id="file-label">Tap to upload MP3 or WAV</p>
             <p class="file-info" id="file-name"></p>
             <input type="file" id="audio-input" accept=".mp3,.wav">
+        </div>
+
+        <div class="toggle-container">
+            <span class="toggle-label" style="opacity: 0.6;">Standard</span>
+            <label class="switch">
+                <input type="checkbox" id="ai-toggle">
+                <span class="slider"></span>
+            </label>
+            <span class="toggle-label">Deep AI Recovery <span class="badge">PRO</span></span>
         </div>
 
         <button class="btn" id="enhance-btn" disabled>Enhance Audio</button>
@@ -254,6 +342,7 @@
         const statusText = document.getElementById('status-text');
         const loader = document.getElementById('loader');
         const downloadLink = document.getElementById('download-link');
+        const aiToggle = document.getElementById('ai-toggle');
 
         input.addEventListener('change', (e) => {
             if (input.files.length > 0) {
@@ -273,6 +362,7 @@
 
             const formData = new FormData();
             formData.append('file', file);
+            formData.append('use_ai', aiToggle.checked);
 
             // UI Reset
             btn.disabled = true;
