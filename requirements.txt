@@ -6,3 +6,4 @@ noisereduce
 pyloudnorm
 scipy
 python-multipart
+gradio_client
